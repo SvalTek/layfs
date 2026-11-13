@@ -1,631 +1,768 @@
-﻿using Fsp;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
-using VolumeInfo = Fsp.Interop.VolumeInfo;
-using FileInfo = Fsp.Interop.FileInfo;
-using System.Security.AccessControl;
+using System.IO.Enumeration;
 using System.Runtime.InteropServices;
-using System.Collections;
+using System.Security.AccessControl;
 
-namespace layfs
+using Fsp;
+
+using FileInfo = Fsp.Interop.FileInfo;
+using VolumeInfo = Fsp.Interop.VolumeInfo;
+
+namespace layfs;
+
+/// <summary>
+/// Union of a writable layer (<c>-w</c>) over a read-only layer (<c>-r</c>).
+/// Files opened from the read-only layer are copied into the writable layer on first write.
+/// </summary>
+internal sealed class LayeredFileSystem : FileSystemBase
 {
-    class LayeredFileSystem : FileSystemBase
+    private readonly string _readOnlyPath;
+    private readonly string _writePath;
+
+    public LayeredFileSystem(string writePath, string readOnlyPath)
     {
-        private string _writePath;
-        private string _readOnlyPath;
+        _writePath = NormalizePath(writePath);
+        _readOnlyPath = NormalizePath(readOnlyPath);
+    }
 
-        private static string NormalizePath(string path)
+    private static string NormalizePath(string path) =>
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+
+    private static bool FileOrDirectoryExists(string path) =>
+        File.Exists(path) || Directory.Exists(path);
+
+    private string GetWritePath(string fileName) => _writePath + fileName;
+
+    private string GetReadOnlyPath(string fileName) => _readOnlyPath + fileName;
+
+    /// <summary>
+    /// Modern .NET no longer has a <see cref="FileStream"/> constructor that takes
+    /// <see cref="FileSystemRights"/>, so collapse the requested access mask down to the
+    /// <see cref="FileAccess"/> it implies.
+    /// </summary>
+    private static FileAccess ToFileAccess(uint grantedAccess)
+    {
+        const FileSystemRights writeRights =
+            FileSystemRights.WriteData |
+            FileSystemRights.AppendData |
+            FileSystemRights.WriteExtendedAttributes |
+            FileSystemRights.WriteAttributes |
+            FileSystemRights.Delete |
+            FileSystemRights.DeleteSubdirectoriesAndFiles |
+            FileSystemRights.ChangePermissions |
+            FileSystemRights.TakeOwnership;
+
+        const uint GenericWrite = 0x40000000;
+        const uint GenericAll = 0x10000000;
+
+        var rights = (FileSystemRights)grantedAccess;
+
+        if (0 != (grantedAccess & (GenericAll | GenericWrite)))
+            return FileAccess.ReadWrite;
+
+        return 0 != (rights & writeRights) ? FileAccess.ReadWrite : FileAccess.Read;
+    }
+
+    public override int ExceptionHandler(Exception ex)
+    {
+        DebugLog.Trace("!! {0}: {1}\n{2}", ex.GetType().Name, ex.Message, ex.StackTrace);
+
+        var hResult = ex.HResult;
+        if (0x80070000 == (hResult & 0xFFFF0000))
+            return NtStatusFromWin32((uint)hResult & 0xFFFF);
+
+        return STATUS_UNEXPECTED_IO_ERROR;
+    }
+
+    /// <summary>
+    /// The historical binding's <c>Create</c> has a different shape than the one this
+    /// WinFsp build dispatches, so trace both entry points.
+    /// </summary>
+    public override int CreateEx(
+        string fileName,
+        uint createOptions,
+        uint grantedAccess,
+        uint fileAttributes,
+        byte[]? securityDescriptor,
+        ulong allocationSize,
+        IntPtr extraBuffer,
+        uint extraLength,
+        bool extraBufferIsReparsePoint,
+        out object? fileNode,
+        out object? fileDesc,
+        out FileInfo fileInfo,
+        out string? normalizedName)
+    {
+        DebugLog.Trace("CreateEx ENTER {0} opts={1} access={2} attrs={3} alloc={4}",
+            fileName, DebugLog.Hex(createOptions), DebugLog.Hex(grantedAccess), DebugLog.Hex(fileAttributes), allocationSize);
+
+        var status = base.CreateEx(
+            fileName,
+            createOptions,
+            grantedAccess,
+            fileAttributes,
+            securityDescriptor,
+            allocationSize,
+            extraBuffer,
+            extraLength,
+            extraBufferIsReparsePoint,
+            out fileNode,
+            out fileDesc,
+            out fileInfo,
+            out normalizedName);
+
+        DebugLog.Trace("CreateEx {0} -> {1}", fileName, DebugLog.Hex(status));
+        return status;
+    }
+
+    public override int Init(object host0)
+    {
+        var host = (FileSystemHost)host0;
+        host.SectorSize = Utils.AllocationUnit;
+        host.SectorsPerAllocationUnit = 1;
+        host.MaxComponentLength = 255;
+        host.FileInfoTimeout = 1000;
+        host.CaseSensitiveSearch = false;
+        host.CasePreservedNames = true;
+        host.UnicodeOnDisk = true;
+        host.PersistentAcls = true;
+        host.PostCleanupWhenModifiedOnly = true;
+        host.PassQueryDirectoryPattern = true;
+        host.VolumeCreationTime = (ulong)File.GetCreationTimeUtc(_writePath).ToFileTimeUtc();
+        host.VolumeSerialNumber = 0;
+
+        DebugLog.Trace(
+            "Init: write={0} read={1} sectorSize={2} sectorsPerUnit={3} maxComponentLength={4} "
+            + "fileInfoTimeout={5} caseSensitive={6} casePreserved={7} unicode={8} persistentAcls={9} "
+            + "postCleanupWhenModifiedOnly={10} passQueryDirectoryPattern={11} volumeSerial={12}",
+            _writePath,
+            _readOnlyPath,
+            host.SectorSize,
+            host.SectorsPerAllocationUnit,
+            host.MaxComponentLength,
+            host.FileInfoTimeout,
+            host.CaseSensitiveSearch,
+            host.CasePreservedNames,
+            host.UnicodeOnDisk,
+            host.PersistentAcls,
+            host.PostCleanupWhenModifiedOnly,
+            host.PassQueryDirectoryPattern,
+            host.VolumeSerialNumber);
+
+        return STATUS_SUCCESS;
+    }
+
+    public override int GetVolumeInfo(out VolumeInfo volumeInfo)
+    {
+        volumeInfo = default;
+        try
         {
-            path = Path.GetFullPath(path);
-            if (path.EndsWith("\\"))
-                path = path.Substring(0, path.Length - 1);
-
-            return path;
+            var info = new DriveInfo(_writePath);
+            volumeInfo.TotalSize = (ulong)info.TotalSize;
+            volumeInfo.FreeSize = (ulong)info.TotalFreeSpace;
+        }
+        catch (ArgumentException)
+        {
+            // DriveInfo only supports drives and does not support UNC paths.
+            // It would be better to use GetDiskFreeSpaceEx here.
         }
 
-        private static bool FileOrDirectoryExists(string path)
+        DebugLog.Trace("GetVolumeInfo -> total={0} free={1}", volumeInfo.TotalSize, volumeInfo.FreeSize);
+        return STATUS_SUCCESS;
+    }
+
+    public override int GetSecurityByName(
+        string fileName,
+        out uint fileAttributes,
+        ref byte[]? securityDescriptor)
+    {
+        fileAttributes = 0;
+
+        var writePath = GetWritePath(fileName);
+        var layer = "write";
+        var exists = FileOrDirectoryExists(writePath);
+
+        if (!exists)
         {
-            return (Directory.Exists(path) || File.Exists(path));
+            layer = "read";
+            writePath = GetReadOnlyPath(fileName);
+            exists = FileOrDirectoryExists(writePath);
         }
 
-        private string GetWritePath(string fileName)
+        // Reporting success for a name that is in neither layer makes WinFsp believe the
+        // entry exists (attributes surface as 0xffffffff), so a create is never dispatched.
+        if (!exists)
         {
-            return _writePath + fileName;
+            DebugLog.Trace("GetSecurityByName {0} -> OBJECT_NAME_NOT_FOUND", fileName);
+            Utils.ThrowIoExceptionWithNtStatus(STATUS_OBJECT_NAME_NOT_FOUND);
         }
 
-        private string GetReadOnlyPath(string fileName)
-        {
-            return _readOnlyPath + fileName;
-        }
+        var info = new System.IO.FileInfo(writePath);
+        fileAttributes = (uint)info.Attributes;
 
-        public LayeredFileSystem(string writePath, string readOnlyPah)
-        {
-            _writePath = NormalizePath(writePath);
-            _readOnlyPath = NormalizePath(readOnlyPah);
-        }
+        if (null != securityDescriptor)
+            securityDescriptor = info.GetAccessControl().GetSecurityDescriptorBinaryForm();
 
-        public override Int32 ExceptionHandler(Exception ex)
-        {
-            Int32 HResult = ex.HResult; /* needs Framework 4.5 */
-            if (0x80070000 == (HResult & 0xFFFF0000))
-                return NtStatusFromWin32((UInt32)HResult & 0xFFFF);
-            return STATUS_UNEXPECTED_IO_ERROR;
-        }
+        DebugLog.Trace("GetSecurityByName {0} layer={1} attrs={2} sd={3}",
+            fileName, layer, DebugLog.Hex(fileAttributes), null != securityDescriptor);
 
-        public override Int32 Init(Object Host0)
-        {
-            FileSystemHost Host = (FileSystemHost)Host0;
-            Host.SectorSize = Utils.ALLOCATION_UNIT;
-            Host.SectorsPerAllocationUnit = 1;
-            Host.MaxComponentLength = 255;
-            Host.FileInfoTimeout = 1000;
-            Host.CaseSensitiveSearch = false;
-            Host.CasePreservedNames = true;
-            Host.UnicodeOnDisk = true;
-            Host.PersistentAcls = true;
-            Host.PostCleanupWhenModifiedOnly = true;
-            Host.PassQueryDirectoryPattern = true;
-            Host.VolumeCreationTime = (UInt64)File.GetCreationTimeUtc(_writePath).ToFileTimeUtc();
-            Host.VolumeSerialNumber = 0;
-            return STATUS_SUCCESS;
-        }
+        return STATUS_SUCCESS;
+    }
 
-        public override Int32 GetVolumeInfo(
-            out VolumeInfo VolumeInfo)
-        {
-            VolumeInfo = default(VolumeInfo);
-            try
-            {
-                DriveInfo Info = new DriveInfo(_writePath);
-                VolumeInfo.TotalSize = (UInt64)Info.TotalSize;
-                VolumeInfo.FreeSize = (UInt64)Info.TotalFreeSpace;
-            }
-            catch (ArgumentException)
-            {
-                /*
-                 * DriveInfo only supports drives and does not support UNC paths.
-                 * It would be better to use GetDiskFreeSpaceEx here.
-                 */
-            }
-            return STATUS_SUCCESS;
-        }
+    public override int Create(
+        string fileName,
+        uint createOptions,
+        uint grantedAccess,
+        uint fileAttributes,
+        byte[]? securityDescriptor,
+        ulong allocationSize,
+        out object? fileNode,
+        out object? fileDesc0,
+        out FileInfo fileInfo,
+        out string? normalizedName)
+    {
+        fileNode = default;
+        normalizedName = default;
 
-        public override Int32 GetSecurityByName(
-            String fileName,
-            out UInt32 fileAttributes /* or ReparsePointIndex */,
-            ref Byte[] securityDescriptor)
-        {
-            string path = GetWritePath(fileName);
+        DebugLog.Trace("Create ENTER {0} opts={1} access={2} attrs={3} alloc={4} sd={5} -> write path {6}",
+            fileName, DebugLog.Hex(createOptions), DebugLog.Hex(grantedAccess), DebugLog.Hex(fileAttributes), allocationSize, null != securityDescriptor, GetWritePath(fileName));
 
-            if(!FileOrDirectoryExists(path))
-            {
-                path = GetReadOnlyPath(fileName);
-            }
-
-            System.IO.FileInfo info = new System.IO.FileInfo(path);
-            fileAttributes = (UInt32)info.Attributes;
-            if (null != securityDescriptor)
-            {
-                if (FileOrDirectoryExists(path))
-                {
-                    securityDescriptor = info.GetAccessControl().GetSecurityDescriptorBinaryForm();
-                }
-            }
-                
-
-            return STATUS_SUCCESS;
-        }
-
-        public override Int32 Create(
-            String fileName,
-            UInt32 createOptions,
-            UInt32 grantedAccess,
-            UInt32 fileAttributes,
-            Byte[] securityDescriptor,
-            UInt64 allocationSize,
-            out Object fileNode,
-            out Object fileDesc0,
-            out FileInfo fileInfo,
-            out String normalizedName)
-        {
-            fileNode = default(Object);
-            normalizedName = default(String);
-
-            FileDescriptor fileDesc = null;
-            try
-            {
-                var path = GetWritePath(fileName);
-
-                // directory or file?
-                if (0 == (createOptions & FILE_DIRECTORY_FILE))
-                {
-                    // file
-
-                    FileSecurity Security = null;
-
-                    if (null != securityDescriptor)
-                    {
-                        Security = new FileSecurity();
-                        Security.SetSecurityDescriptorBinaryForm(securityDescriptor);
-                    }
-
-                    fileDesc = new FileDescriptor(fileName,
-                        new FileStream(
-                            path,
-                            FileMode.CreateNew,
-                            (FileSystemRights)grantedAccess | FileSystemRights.WriteAttributes,
-                            FileShare.Read | FileShare.Write | FileShare.Delete,
-                            4096,
-                            0,
-                            Security), true);
-
-                    fileDesc.SetFileAttributes(fileAttributes | (UInt32)System.IO.FileAttributes.Archive);
-                }
-                else
-                {
-                    // directory
-
-                    if (Directory.Exists(path))
-                        Utils.ThrowIoExceptionWithNtStatus(STATUS_OBJECT_NAME_COLLISION);
-
-                    DirectorySecurity Security = null;
-
-                    if (null != securityDescriptor)
-                    {
-                        Security = new DirectorySecurity();
-                        Security.SetSecurityDescriptorBinaryForm(securityDescriptor);
-                    }
-
-                    fileDesc = new FileDescriptor(fileName, Directory.CreateDirectory(path, Security), true);
-
-                    fileDesc.SetFileAttributes(fileAttributes);
-                }
-
-                // assign the file descriptor
-                fileDesc0 = fileDesc;
-                return fileDesc.GetFileInfo(out fileInfo);
-            }
-            catch 
-            {
-                if (null != fileDesc)
-                    fileDesc.Dispose();
-
-                throw;
-            }
-        }
-
-        public override Int32 Open(
-            String fileName,
-            UInt32 createOptions,
-            UInt32 grantedAccess,
-            out Object fileNode,
-            out Object fileDesc0,
-            out FileInfo fileInfo,
-            out String normalizedName)
-        {
-            fileNode = default(Object);
-            normalizedName = default(String);
-
-            FileDescriptor fileDesc = null;
-
-            try
-            {
-                string path = GetWritePath(fileName);
-                
-                if(Directory.Exists(path))
-                {
-                    fileDesc = new FileDescriptor(fileName, new DirectoryInfo(path), true);
-
-                    path = GetReadOnlyPath(fileName);
-                    if(Directory.Exists(path))
-                    {
-                        fileDesc.ReadOnlyDirInfo = new DirectoryInfo(path);
-                    }
-                }
-                else if(File.Exists(path))
-                {
-                    fileDesc = new FileDescriptor(fileName, 
-                        new FileStream(
-                            path,
-                            FileMode.Open,
-                            (FileSystemRights)grantedAccess,
-                            FileShare.Read | FileShare.Write | FileShare.Delete,
-                            4096,
-                            0), true);
-                }
-                else
-                {
-                    path = GetReadOnlyPath(fileName);
-                    if (Directory.Exists(path))
-                    {
-                        fileDesc = new FileDescriptor(fileName, new DirectoryInfo(path), false);
-                    }
-                    else if (File.Exists(path))
-                    {
-                        fileDesc = new FileDescriptor(fileName, 
-                            new FileStream(
-                                path,
-                                FileMode.Open,
-                                (FileSystemRights)grantedAccess,
-                                FileShare.Read | FileShare.Write | FileShare.Delete,
-                                4096,
-                                0), false);
-                    }
-                    else
-                    {
-                        throw new FileNotFoundException();
-                    }
-                }
-
-                fileDesc0 = fileDesc;
-                return fileDesc.GetFileInfo(out fileInfo);
-            }
-            catch
-            {
-                if (fileDesc != null)
-                    fileDesc.Dispose();
-
-                throw;
-            }
-        }
-
-        public void MakeWriteable(FileDescriptor fileDesc)
-        {
-            if(!fileDesc.IsWriteable())
-            {
-                var path = Path.GetDirectoryName(GetWritePath(fileDesc.FileName));
-                if(!Directory.Exists(path))
-                    Directory.CreateDirectory(path);
-
-                path = GetWritePath(fileDesc.FileName);
-
-                File.Copy(GetReadOnlyPath(fileDesc.FileName), path, true);
-
-                fileDesc.WriteStream = new FileStream(
-                    path, 
-                    FileMode.Open, 
-                    FileAccess.ReadWrite, 
-                    FileShare.Read | FileShare.Write | FileShare.Delete, 
-                    4096, 0);
-            }
-        }
-
-        public override Int32 Overwrite(
-            Object fileNode,
-            Object fileDesc0,
-            UInt32 fileAttributes,
-            Boolean replaceFileAttributes,
-            UInt64 allocationSize,
-            out FileInfo fileInfo)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-
-            MakeWriteable(fileDesc);
-
-            if (replaceFileAttributes)
-                fileDesc.SetFileAttributes(fileAttributes | (UInt32)System.IO.FileAttributes.Archive);
-            else if (0 != fileAttributes)
-                fileDesc.SetFileAttributes(fileDesc.GetFileAttributes() | fileAttributes | (UInt32)System.IO.FileAttributes.Archive);
-
-            fileDesc.WriteStream.SetLength(0);
-
-            return fileDesc.GetFileInfo(out fileInfo);
-        }
-
-        public override void Cleanup(
-            Object fileNode,
-            Object fileDesc0,
-            String fileName,
-            UInt32 flags)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-            if (0 != (flags & CleanupDelete))
-            {
-                fileDesc.SetDisposition(true);
-                fileDesc.Dispose();
-            }
-        }
-
-        public override void Close(
-            Object fileNode,
-            Object fileDesc0)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-            fileDesc.Close();
-        }
-
-        public override Int32 Read(
-            Object fileNode,
-            Object fileDesc0,
-            IntPtr buffer,
-            UInt64 offset,
-            UInt32 length,
-            out UInt32 PBytesTransferred)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-
-            FileStream stream = fileDesc.GetReadStream();
-
-            if (offset >= (UInt64)stream.Length)
-                Utils.ThrowIoExceptionWithNtStatus(STATUS_END_OF_FILE);
-
-            Byte[] Bytes = new byte[length];
-
-            stream.Seek((Int64)offset, SeekOrigin.Begin);
-
-            PBytesTransferred = (UInt32)stream.Read(Bytes, 0, Bytes.Length);
-            Marshal.Copy(Bytes, 0, buffer, Bytes.Length);
-            return STATUS_SUCCESS;
-        }
-
-        public override Int32 Write(
-            Object fileNode,
-            Object fileDesc0,
-            IntPtr buffer,
-            UInt64 offset,
-            UInt32 length,
-            Boolean writeToEndOfFile,
-            Boolean constrainedIo,
-            out UInt32 pBytesTransferred,
-            out FileInfo fileInfo)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-
-            MakeWriteable(fileDesc);
-
-            FileStream stream = fileDesc.WriteStream;
-
-            if (constrainedIo)
-            {
-                if (offset >= (UInt64)stream.Length)
-                {
-                    pBytesTransferred = default(UInt32);
-                    fileInfo = default(FileInfo);
-                    return STATUS_SUCCESS;
-                }
-                if (offset + length > (UInt64)stream.Length)
-                    length = (UInt32)((UInt64)stream.Length - offset);
-            }
-            Byte[] bytes = new byte[length];
-            Marshal.Copy(buffer, bytes, 0, bytes.Length);
-            if (!writeToEndOfFile)
-                stream.Seek((Int64)offset, SeekOrigin.Begin);
-
-            stream.Write(bytes, 0, bytes.Length);
-            pBytesTransferred = (UInt32)bytes.Length;
-
-            return fileDesc.GetFileInfo(out fileInfo);
-
-        }
-
-        public override Int32 Flush(
-            Object fileNode,
-            Object fileDesc0,
-            out FileInfo fileInfo)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-            if (null == fileDesc)
-            {
-                /* we do not flush the whole volume, so just return SUCCESS */
-                fileInfo = default(FileInfo);
-                return STATUS_SUCCESS;
-            }
-
-            fileDesc.Flush();
-
-            return fileDesc.GetFileInfo(out fileInfo);
-        }
-
-        public override Int32 GetFileInfo(
-            Object fileNode,
-            Object fileDesc0,
-            out FileInfo fileInfo)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-            return fileDesc.GetFileInfo(out fileInfo);
-        }
-
-        public override Int32 SetBasicInfo(
-            Object fileNode,
-            Object fileDesc0,
-            UInt32 fileAttributes,
-            UInt64 creationTime,
-            UInt64 lastAccessTime,
-            UInt64 lastWriteTime,
-            UInt64 changeTime,
-            out FileInfo fileInfo)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-            MakeWriteable(fileDesc);
-            fileDesc.SetBasicInfo(fileAttributes, creationTime, lastAccessTime, lastWriteTime);
-
-            return fileDesc.GetFileInfo(out fileInfo);
-        }
-
-        public override Int32 SetFileSize(
-            Object fileNode,
-            Object fileDesc0,
-            UInt64 newSize,
-            Boolean setAllocationSize,
-            out FileInfo fileInfo)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-            MakeWriteable(fileDesc);
-
-            if (!setAllocationSize || (UInt64)fileDesc.WriteStream.Length > newSize)
-            {
-                /*
-                 * "FileInfo.FileSize > NewSize" explanation:
-                 * Ptfs does not support allocation size. However if the new AllocationSize
-                 * is less than the current FileSize we must truncate the file.
-                 */
-                fileDesc.WriteStream.SetLength((Int64)newSize);
-            }
-            return fileDesc.GetFileInfo(out fileInfo);
-        }
-
-        public override Int32 CanDelete(
-            Object fileNode,
-            Object fileDesc0,
-            String fileName)
-        {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-
-            if(fileDesc.IsWriteable())
-            {
-                fileDesc.SetDisposition(false);
-                return STATUS_SUCCESS;
-            }
-            else
-            {
-                return STATUS_ACCESS_DENIED;
-            }
-        }
-
-        public override Int32 Rename(
-            Object fileNode,
-            Object fileDesc0,
-            String fileName,
-            String newFileName,
-            Boolean replaceIfExists)
+        FileDescriptor? fileDesc = null;
+        try
         {
             var path = GetWritePath(fileName);
 
-            if (FileOrDirectoryExists(path))
+            if (0 == (createOptions & FILE_DIRECTORY_FILE))
             {
-                if (!Utils.MoveFileExW(path, GetWritePath(newFileName), replaceIfExists ? 1U/*MOVEFILE_REPLACE_EXISTING*/ : 0))
-                    Utils.ThrowIoExceptionWithWin32(Marshal.GetLastWin32Error());
+                const FileShare share = FileShare.Read | FileShare.Write | FileShare.Delete;
+
+                FileStream stream;
+                if (null == securityDescriptor)
+                {
+                    stream = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, share, 4096, FileOptions.None);
+                }
+                else
+                {
+                    var security = new FileSecurity();
+                    security.SetSecurityDescriptorBinaryForm(securityDescriptor);
+
+                    stream = new System.IO.FileInfo(path).Create(
+                        FileMode.CreateNew,
+                        (FileSystemRights)grantedAccess | FileSystemRights.WriteAttributes,
+                        share,
+                        4096,
+                        FileOptions.None,
+                        security);
+                }
+
+                fileDesc = new FileDescriptor(fileName, stream, true);
+                fileDesc.SetFileAttributes(fileAttributes | (uint)System.IO.FileAttributes.Archive);
+            }
+            else
+            {
+                if (Directory.Exists(path))
+                    Utils.ThrowIoExceptionWithNtStatus(STATUS_OBJECT_NAME_COLLISION);
+
+                var dirInfo = new DirectoryInfo(path);
+                if (null == securityDescriptor)
+                {
+                    dirInfo.Create();
+                }
+                else
+                {
+                    var security = new DirectorySecurity();
+                    security.SetSecurityDescriptorBinaryForm(securityDescriptor);
+                    dirInfo.Create(security);
+                }
+
+                fileDesc = new FileDescriptor(fileName, dirInfo, true);
+                fileDesc.SetFileAttributes(fileAttributes);
+            }
+
+            fileDesc0 = fileDesc;
+            return fileDesc.GetFileInfo(out fileInfo);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Trace("Create FAILED {0}: {1}", fileName, ex);
+            fileDesc?.Dispose();
+            throw;
+        }
+    }
+
+    public override int Open(
+        string fileName,
+        uint createOptions,
+        uint grantedAccess,
+        out object? fileNode,
+        out object? fileDesc0,
+        out FileInfo fileInfo,
+        out string? normalizedName)
+    {
+        fileNode = default;
+        normalizedName = default;
+
+        DebugLog.Trace("Open ENTER {0} opts={1} access={2}",
+            fileName, DebugLog.Hex(createOptions), DebugLog.Hex(grantedAccess));
+
+        FileDescriptor? fileDesc = null;
+
+        try
+        {
+            var path = GetWritePath(fileName);
+
+            if (Directory.Exists(path))
+            {
+                fileDesc = new FileDescriptor(fileName, new DirectoryInfo(path), true);
+
+                path = GetReadOnlyPath(fileName);
+                if (Directory.Exists(path))
+                    fileDesc.ReadOnlyDirInfo = new DirectoryInfo(path);
+            }
+            else if (File.Exists(path))
+            {
+                fileDesc = new FileDescriptor(
+                    fileName,
+                    new FileStream(
+                        path,
+                        FileMode.Open,
+                        ToFileAccess(grantedAccess),
+                        FileShare.Read | FileShare.Write | FileShare.Delete,
+                        4096,
+                        FileOptions.None),
+                    true);
+            }
+            else
+            {
+                path = GetReadOnlyPath(fileName);
+                if (Directory.Exists(path))
+                {
+                    fileDesc = new FileDescriptor(fileName, new DirectoryInfo(path), false);
+                }
+                else if (File.Exists(path))
+                {
+                    fileDesc = new FileDescriptor(
+                        fileName,
+                        new FileStream(
+                            path,
+                            FileMode.Open,
+                            ToFileAccess(grantedAccess),
+                            FileShare.Read | FileShare.Write | FileShare.Delete,
+                            4096,
+                            FileOptions.None),
+                        false);
+                }
+                else
+                {
+                    DebugLog.Trace("Open NOT FOUND {0} (write={1} read={2})", fileName, _writePath + fileName, _readOnlyPath + fileName);
+                    throw new FileNotFoundException();
+                }
+            }
+
+            fileDesc0 = fileDesc;
+            DebugLog.Trace("Open OK {0} writeable={1} dir={2}", fileName, fileDesc.IsWriteable(), fileDesc.IsDirectory());
+            return fileDesc.GetFileInfo(out fileInfo);
+        }
+        catch
+        {
+            fileDesc?.Dispose();
+            throw;
+        }
+    }
+
+    private void MakeWriteable(FileDescriptor fileDesc)
+    {
+        if (fileDesc.IsWriteable())
+            return;
+
+        DebugLog.Trace("MakeWriteable {0}", fileDesc.FileName);
+
+        var parentPath = Path.GetDirectoryName(GetWritePath(fileDesc.FileName));
+        if (null != parentPath && !Directory.Exists(parentPath))
+            Directory.CreateDirectory(parentPath);
+
+        var path = GetWritePath(fileDesc.FileName);
+
+        File.Copy(GetReadOnlyPath(fileDesc.FileName), path, true);
+
+        fileDesc.WriteStream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.Read | FileShare.Write | FileShare.Delete,
+            4096,
+            0);
+    }
+
+    public override int Overwrite(
+        object fileNode,
+        object fileDesc0,
+        uint fileAttributes,
+        bool replaceFileAttributes,
+        ulong allocationSize,
+        out FileInfo fileInfo)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+
+        DebugLog.Trace("Overwrite {0} replace={1} attrs={2} alloc={3}",
+            fileDesc.FileName, replaceFileAttributes, DebugLog.Hex(fileAttributes), allocationSize);
+
+        MakeWriteable(fileDesc);
+
+        if (replaceFileAttributes)
+            fileDesc.SetFileAttributes(fileAttributes | (uint)System.IO.FileAttributes.Archive);
+        else if (0 != fileAttributes)
+            fileDesc.SetFileAttributes(fileDesc.GetFileAttributes() | fileAttributes | (uint)System.IO.FileAttributes.Archive);
+
+        fileDesc.WriteStream!.SetLength(0);
+
+        return fileDesc.GetFileInfo(out fileInfo);
+    }
+
+    public override void Cleanup(
+        object fileNode,
+        object fileDesc0,
+        string? fileName,
+        uint flags)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+
+        DebugLog.Trace("Cleanup {0} flags={1} writeable={2}", fileName ?? fileDesc.FileName, DebugLog.Hex(flags), fileDesc.IsWriteable());
+
+        if (0 != (flags & CleanupDelete))
+        {
+            var path = GetWritePath(fileName ?? fileDesc.FileName);
+            var isDirectory = fileDesc.IsDirectory();
+
+            DebugLog.Trace("Cleanup DELETE {0} path={1} dir={2}", fileDesc.FileName, path, isDirectory);
+
+            // The handle does not grant delete access, and the stream keeps the file open,
+            // so release it before deleting by path.
+            fileDesc.Dispose();
+
+            if (isDirectory)
+                Directory.Delete(path, recursive: false);
+            else
+                File.Delete(path);
+        }
+    }
+
+    public override void Close(object fileNode, object fileDesc0)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+        DebugLog.Trace("Close {0}", fileDesc.FileName);
+        fileDesc.Close();
+    }
+
+    public override int Read(
+        object fileNode,
+        object fileDesc0,
+        IntPtr buffer,
+        ulong offset,
+        uint length,
+        out uint bytesTransferred)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+
+        var stream = fileDesc.GetReadStream();
+
+        DebugLog.Trace("Read {0} offset={1} length={2} streamLen={3}", fileDesc.FileName, offset, length, stream.Length);
+
+        if (offset >= (ulong)stream.Length)
+            Utils.ThrowIoExceptionWithNtStatus(STATUS_END_OF_FILE);
+
+        var bytes = new byte[length];
+
+        stream.Seek((long)offset, SeekOrigin.Begin);
+
+        bytesTransferred = (uint)stream.Read(bytes, 0, bytes.Length);
+        Marshal.Copy(bytes, 0, buffer, (int)bytesTransferred);
+        return STATUS_SUCCESS;
+    }
+
+    public override int Write(
+        object fileNode,
+        object fileDesc0,
+        IntPtr buffer,
+        ulong offset,
+        uint length,
+        bool writeToEndOfFile,
+        bool constrainedIo,
+        out uint bytesTransferred,
+        out FileInfo fileInfo)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+
+        DebugLog.Trace("Write {0} offset={1} length={2} toEof={3} constrained={4} writeable={5}",
+            fileDesc.FileName, offset, length, writeToEndOfFile, constrainedIo, fileDesc.IsWriteable());
+
+        MakeWriteable(fileDesc);
+
+        var stream = fileDesc.WriteStream!;
+
+        if (constrainedIo)
+        {
+            if (offset >= (ulong)stream.Length)
+            {
+                bytesTransferred = default;
+                fileInfo = default;
                 return STATUS_SUCCESS;
             }
-            else
-            {
-                return STATUS_ACCESS_DENIED;
-            }
+
+            if (offset + length > (ulong)stream.Length)
+                length = (uint)((ulong)stream.Length - offset);
         }
 
-        public override Int32 GetSecurity(
-            Object fileNode,
-            Object fileDesc0,
-            ref Byte[] securityDescriptor)
+        var bytes = new byte[length];
+        Marshal.Copy(buffer, bytes, 0, bytes.Length);
+
+        if (!writeToEndOfFile)
+            stream.Seek((long)offset, SeekOrigin.Begin);
+
+        stream.Write(bytes, 0, bytes.Length);
+        bytesTransferred = length;
+
+        return fileDesc.GetFileInfo(out fileInfo);
+    }
+
+    public override int Flush(object fileNode, object? fileDesc0, out FileInfo fileInfo)
+    {
+        var fileDesc = (FileDescriptor?)fileDesc0;
+        if (null == fileDesc)
         {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-            securityDescriptor = fileDesc.GetSecurityDescriptor();
+            // We do not flush the whole volume.
+            DebugLog.Trace("Flush <volume>");
+            fileInfo = default;
             return STATUS_SUCCESS;
         }
 
-        public override Int32 SetSecurity(
-            Object fileNode,
-            Object fileDesc0,
-            AccessControlSections sections,
-            Byte[] securityDescriptor)
+        DebugLog.Trace("Flush {0}", fileDesc.FileName);
+        fileDesc.Flush();
+
+        return fileDesc.GetFileInfo(out fileInfo);
+    }
+
+    public override int GetFileInfo(object fileNode, object fileDesc0, out FileInfo fileInfo)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+        DebugLog.Trace("GetFileInfo {0} writeable={1}", fileDesc.FileName, fileDesc.IsWriteable());
+        return fileDesc.GetFileInfo(out fileInfo);
+    }
+
+    public override int SetBasicInfo(
+        object fileNode,
+        object fileDesc0,
+        uint fileAttributes,
+        ulong creationTime,
+        ulong lastAccessTime,
+        ulong lastWriteTime,
+        ulong changeTime,
+        out FileInfo fileInfo)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+        DebugLog.Trace("SetBasicInfo {0} attrs={1} ctime={2} atime={3} mtime={4}",
+            fileDesc.FileName, DebugLog.Hex(fileAttributes), creationTime, lastAccessTime, lastWriteTime);
+        MakeWriteable(fileDesc);
+        fileDesc.SetBasicInfo(fileAttributes, creationTime, lastAccessTime, lastWriteTime);
+
+        return fileDesc.GetFileInfo(out fileInfo);
+    }
+
+    public override int SetFileSize(
+        object fileNode,
+        object fileDesc0,
+        ulong newSize,
+        bool setAllocationSize,
+        out FileInfo fileInfo)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+        DebugLog.Trace("SetFileSize {0} newSize={1} allocation={2}", fileDesc.FileName, newSize, setAllocationSize);
+        MakeWriteable(fileDesc);
+
+        if (!setAllocationSize || (ulong)fileDesc.WriteStream!.Length > newSize)
         {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-
-            MakeWriteable(fileDesc);
-
-            fileDesc.SetSecurityDescriptor(sections, securityDescriptor);
-
-            return STATUS_SUCCESS;
+            // Allocation size is not supported, but a smaller allocation size must still truncate.
+            fileDesc.WriteStream!.SetLength((long)newSize);
         }
 
-        public override Boolean ReadDirectoryEntry(
-            Object fileNode,
-            Object fileDesc0,
-            String pattern,
-            String marker,
-            ref Object context,
-            out String fileName,
-            out FileInfo fileInfo)
+        return fileDesc.GetFileInfo(out fileInfo);
+    }
+
+    public override int CanDelete(object fileNode, object fileDesc0, string fileName)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+
+        // Deletions only ever touch the writable layer. Without whiteout support an entry
+        // that only exists in a read-only layer cannot be shadowed, so it is not deletable.
+        if (!fileDesc.IsWriteable())
         {
-            FileDescriptor fileDesc = (FileDescriptor)fileDesc0;
-            if (null == fileDesc.FileSystemInfos)
+            DebugLog.Trace("CanDelete {0} -> ACCESS_DENIED (read-only layer)", fileDesc.FileName);
+            return STATUS_ACCESS_DENIED;
+        }
+
+        if (fileDesc.IsDirectory() && !IsEmptyInUnion(fileDesc.FileName))
+        {
+            DebugLog.Trace("CanDelete {0} -> DIRECTORY_NOT_EMPTY", fileDesc.FileName);
+            return STATUS_DIRECTORY_NOT_EMPTY;
+        }
+
+        DebugLog.Trace("CanDelete {0} -> OK", fileDesc.FileName);
+        return STATUS_SUCCESS;
+    }
+
+    /// <summary>
+    /// Emptiness is a property of the merged view: a directory that is empty on the write
+    /// layer can still show lower-layer children, and deleting it would expose the lower copy.
+    /// </summary>
+    private bool IsEmptyInUnion(string fileName)
+    {
+        var writeDir = new DirectoryInfo(GetWritePath(fileName));
+        if (writeDir.Exists && writeDir.EnumerateFileSystemInfos().Any())
+            return false;
+
+        var readDir = new DirectoryInfo(GetReadOnlyPath(fileName));
+        return !readDir.Exists || !readDir.EnumerateFileSystemInfos().Any();
+    }
+
+    public override int Rename(
+        object fileNode,
+        object fileDesc0,
+        string fileName,
+        string newFileName,
+        bool replaceIfExists)
+    {
+        // Only the writable layer supports renames; a lower-layer entry cannot be shadowed.
+        var path = GetWritePath(fileName);
+
+        DebugLog.Trace("Rename {0} -> {1} replace={2} writeExists={3}", fileName, newFileName, replaceIfExists, FileOrDirectoryExists(path));
+
+        if (!FileOrDirectoryExists(path))
+            return STATUS_ACCESS_DENIED;
+
+        if (!Utils.MoveFileExW(path, GetWritePath(newFileName), replaceIfExists ? 1U/*MOVEFILE_REPLACE_EXISTING*/ : 0))
+            Utils.ThrowIoExceptionWithWin32(Marshal.GetLastWin32Error());
+
+        return STATUS_SUCCESS;
+    }
+
+    public override int GetSecurity(object fileNode, object fileDesc0, ref byte[] securityDescriptor)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+        securityDescriptor = fileDesc.GetSecurityDescriptor();
+        DebugLog.Trace("GetSecurity {0} bytes={1}", fileDesc.FileName, securityDescriptor.Length);
+        return STATUS_SUCCESS;
+    }
+
+    public override int SetSecurity(
+        object fileNode,
+        object fileDesc0,
+        AccessControlSections sections,
+        byte[] securityDescriptor)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+
+        DebugLog.Trace("SetSecurity {0} sections={1} bytes={2}", fileDesc.FileName, sections, securityDescriptor.Length);
+
+        MakeWriteable(fileDesc);
+        fileDesc.SetSecurityDescriptor(sections, securityDescriptor);
+
+        return STATUS_SUCCESS;
+    }
+
+    public override bool ReadDirectoryEntry(
+        object fileNode,
+        object fileDesc0,
+        string? pattern,
+        string? marker,
+        ref object? context,
+        out string? fileName,
+        out FileInfo fileInfo)
+    {
+        var fileDesc = (FileDescriptor)fileDesc0;
+
+        DebugLog.Trace("ReadDirectoryEntry {0} pattern={1} marker={2} context={3} cached={4}",
+            fileDesc.FileName, pattern ?? "<all>", marker ?? "-", context?.ToString() ?? "-", null != fileDesc.DirectoryEntries);
+
+        var entries = fileDesc.DirectoryEntries;
+        if (null == entries)
+        {
+            var findPattern = pattern?.Replace('<', '*').Replace('>', '?').Replace('"', '.') ?? "*";
+
+            var list = new SortedList<string, FileSystemInfo>(StringComparer.OrdinalIgnoreCase);
+
+            // The parent entries come from whichever layer the open resolved against.
+            var primaryDir = fileDesc.IsWriteable() ? fileDesc.WriteDirInfo : fileDesc.ReadOnlyDirInfo;
+            if (null != primaryDir?.Parent)
             {
-                if (null != pattern)
-                    pattern = pattern.Replace('<', '*').Replace('>', '?').Replace('"', '.');
-                else
-                    pattern = "*";
-
-                SortedList list = new SortedList();
-
-                if (fileDesc.IsWriteable())
-                {
-                    if (null != fileDesc.WriteDirInfo && null != fileDesc.WriteDirInfo.Parent)
-                    {
-                        list.Add(".", fileDesc.WriteDirInfo);
-                        list.Add("..", fileDesc.WriteDirInfo.Parent);
-                    }
-                }
-                else
-                {
-                    if (null != fileDesc.ReadOnlyDirInfo && null != fileDesc.ReadOnlyDirInfo.Parent)
-                    {
-                        list.Add(".", fileDesc.ReadOnlyDirInfo);
-                        list.Add("..", fileDesc.ReadOnlyDirInfo.Parent);
-                    }
-                }
-
-                if(fileDesc.WriteDirInfo != null)
-                {
-                    IEnumerable e = fileDesc.WriteDirInfo.EnumerateFileSystemInfos(pattern);
-
-                    foreach (FileSystemInfo info in e)
-                        list.Add(info.Name, info);
-                }
-
-                if (fileDesc.ReadOnlyDirInfo != null)
-                {
-                    IEnumerable e = fileDesc.ReadOnlyDirInfo.EnumerateFileSystemInfos(pattern);
-
-                    foreach (FileSystemInfo info in e)
-                    {
-                        if(!list.ContainsKey(info.Name))
-                        {
-                            list.Add(info.Name, info);
-                        }
-                    }
-                }
-
-                fileDesc.FileSystemInfos = new DictionaryEntry[list.Count];
-
-                list.CopyTo(fileDesc.FileSystemInfos, 0);
+                list.Add(".", primaryDir);
+                list.Add("..", primaryDir.Parent);
             }
-            int index;
-            if (null == context)
+
+            AddLayerEntries(list, fileDesc.WriteDirInfo);
+            AddLayerEntries(list, fileDesc.ReadOnlyDirInfo);
+
+            // PassQueryDirectoryPattern is enabled, so the pattern is ours to honor.
+            var matched = list
+                .Where(entry => FileSystemName.MatchesSimpleExpression(findPattern, entry.Key, ignoreCase: true))
+                .ToArray();
+
+            DebugLog.Trace("  pattern {0} matched {1} of {2} entries for {3}: {4}",
+                findPattern, matched.Length, list.Count, fileDesc.FileName, string.Join(", ", matched.Select(entry => entry.Key)));
+
+            fileDesc.DirectoryEntries = matched;
+            entries = matched;
+        }
+
+        int index;
+        if (null == context)
+        {
+            index = 0;
+            if (null != marker)
             {
-                index = 0;
-                if (null != marker)
-                {
-                    index = Array.BinarySearch(fileDesc.FileSystemInfos,
-                        new DictionaryEntry(marker, null),
-                        Utils._DirectoryEntryComparer);
-                    if (0 <= index)
-                        index++;
-                    else
-                        index = ~index;
-                }
-            }
-            else
-                index = (int)context;
-            if (fileDesc.FileSystemInfos.Length > index)
-            {
-                context = index + 1;
-                fileName = (String)fileDesc.FileSystemInfos[index].Key;
-                Utils.GetFileInfoFromFileSystemInfo(
-                    (FileSystemInfo)fileDesc.FileSystemInfos[index].Value,
-                    out fileInfo);
-                return true;
-            }
-            else
-            {
-                fileName = default(String);
-                fileInfo = default(FileInfo);
-                return false;
+                index = Array.BinarySearch(
+                    entries,
+                    new KeyValuePair<string, FileSystemInfo>(marker, null!),
+                    DirectoryEntryComparer.Instance);
+                index = 0 <= index ? index + 1 : ~index;
             }
         }
+        else
+        {
+            index = (int)context;
+        }
+
+        if (entries.Length > index)
+        {
+            context = index + 1;
+            fileName = entries[index].Key;
+            Utils.GetFileInfoFromFileSystemInfo(entries[index].Value, out fileInfo);
+            return true;
+        }
+
+        DebugLog.Trace("ReadDirectoryEntry {0} -> end at index {1}", fileDesc.FileName, index);
+        fileName = default;
+        fileInfo = default;
+        return false;
+    }
+
+    private static void AddLayerEntries(
+        SortedList<string, FileSystemInfo> list,
+        DirectoryInfo? dirInfo)
+    {
+        if (null == dirInfo)
+            return;
+
+        foreach (var info in dirInfo.EnumerateFileSystemInfos())
+        {
+            if (!list.ContainsKey(info.Name))
+                list.Add(info.Name, info);
+        }
+    }
+
+    private sealed class DirectoryEntryComparer : IComparer<KeyValuePair<string, FileSystemInfo>>
+    {
+        public static readonly DirectoryEntryComparer Instance = new();
+
+        public int Compare(KeyValuePair<string, FileSystemInfo> x, KeyValuePair<string, FileSystemInfo> y) =>
+            StringComparer.OrdinalIgnoreCase.Compare(x.Key, y.Key);
     }
 }
